@@ -1,0 +1,386 @@
+/* quest.cc - Command line search tool using Xapian::QueryParser.
+    2  *
+    3  * Copyright (C) 2004,2005,2006,2007,2008,2009,2010,2012,2013,2014 Olly Betts
+    4  *
+    5  * This program is free software; you can redistribute it and/or
+    6  * modify it under the terms of the GNU General Public License as
+    7  * published by the Free Software Foundation; either version 2 of the
+    8  * License, or (at your option) any later version.
+    9  *
+   10  * This program is distributed in the hope that it will be useful,
+   11  * but WITHOUT ANY WARRANTY; without even the implied warranty of
+   12  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   13  * GNU General Public License for more details.
+   14  *
+   15  * You should have received a copy of the GNU General Public License
+   16  * along with this program; if not, write to the Free Software
+   17  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA  02110-1301
+   18  * USA
+   19  */
+   20 
+   21 #include <config.h>
+   22 
+   23 #include <xapian.h>
+   24 
+   25 #include <cstdlib>
+   26 #include <cstring>
+   27 
+   28 #include <algorithm>
+   29 #include <iostream>
+   30 
+   31 #include "gnu_getopt.h"
+   32 
+   33 using namespace std;
+   34 
+   35 #define PROG_NAME "quest"
+   36 #define PROG_DESC "Xapian command line search tool"
+   37 
+   38 // Stopwords:
+   39 static const char * sw[] = {
+   40     "a", "about", "an", "and", "are", "as", "at",
+   41     "be", "by",
+   42     "en",
+   43     "for", "from",
+   44     "how",
+   45     "i", "in", "is", "it",
+   46     "of", "on", "or",
+   47     "that", "the", "this", "to",
+   48     "was", "what", "when", "where", "which", "who", "why", "will", "with"
+   49 };
+   50 
+   51 struct qp_flag { const char * s; unsigned f; };
+   52 static qp_flag flag_tab[] = {
+   53     { "auto_multiword_synonyms", Xapian::QueryParser::FLAG_AUTO_MULTIWORD_SYNONYMS },
+   54     { "auto_synonyms", Xapian::QueryParser::FLAG_AUTO_SYNONYMS },
+   55     { "boolean", Xapian::QueryParser::FLAG_BOOLEAN },
+   56     { "boolean_any_case", Xapian::QueryParser::FLAG_BOOLEAN_ANY_CASE },
+   57     { "default", Xapian::QueryParser::FLAG_DEFAULT },
+   58     { "lovehate", Xapian::QueryParser::FLAG_LOVEHATE },
+   59     { "partial", Xapian::QueryParser::FLAG_PARTIAL },
+   60     { "phrase", Xapian::QueryParser::FLAG_PHRASE },
+   61     { "pure_not", Xapian::QueryParser::FLAG_PURE_NOT },
+   62     { "spelling_correction", Xapian::QueryParser::FLAG_SPELLING_CORRECTION },
+   63     { "synonym", Xapian::QueryParser::FLAG_SYNONYM },
+   64     { "wildcard", Xapian::QueryParser::FLAG_WILDCARD }
+   65 };
+   66 const int n_flag_tab = sizeof(flag_tab) / sizeof(flag_tab[0]);
+   67 
+   68 inline bool operator<(const qp_flag & f1, const qp_flag & f2) {
+   69     return strcmp(f1.s, f2.s) < 0;
+   70 }
+   71 
+   72 struct qp_op { const char * s; unsigned f; };
+   73 static qp_op op_tab[] = {
+   74     { "and", Xapian::Query::OP_AND },
+   75     { "elite_set", Xapian::Query::OP_ELITE_SET },
+   76     { "near", Xapian::Query::OP_NEAR },
+   77     { "or", Xapian::Query::OP_OR },
+   78     { "phrase", Xapian::Query::OP_PHRASE },
+   79     { "synonym", Xapian::Query::OP_SYNONYM }
+   80 };
+   81 const int n_op_tab = sizeof(op_tab) / sizeof(op_tab[0]);
+   82 
+   83 inline bool operator<(const qp_op & f1, const qp_op & f2) {
+   84     return strcmp(f1.s, f2.s) < 0;
+   85 }
+   86 
+   87 enum {
+   88     WEIGHT_BM25,
+   89     WEIGHT_BOOL,
+   90     WEIGHT_TRAD
+   91 };
+   92 
+   93 struct wt { const char * s; int f; };
+   94 static wt wt_tab[] = {
+   95     { "bm25",   WEIGHT_BM25 },
+   96     { "bool",   WEIGHT_BOOL },
+   97     { "trad",   WEIGHT_TRAD }
+   98 };
+   99 const int n_wt_tab = sizeof(wt_tab) / sizeof(wt_tab[0]);
+  100 
+  101 inline bool operator<(const wt & f1, const wt & f2) {
+  102     return strcmp(f1.s, f2.s) < 0;
+  103 }
+  104 
+  105 static void show_usage() {
+  106     cout << "Usage: "PROG_NAME" [OPTIONS] 'QUERY'\n"
+  107 "NB: QUERY should be quoted to protect it from the shell.\n\n"
+  108 "Options:\n"
+  109 "  -d, --db=DIRECTORY                database to search (multiple databases may\n"
+  110 "                                    be specified)\n"
+  111 "  -m, --msize=MSIZE                 maximum number of matches to return\n"
+  112 "  -c, --check-at-least=HOWMANY      minimum number of matches to check\n"
+  113 "  -s, --stemmer=LANG                set the stemming language, the default is\n"
+  114 "                                    'english' (pass 'none' to disable stemming)\n"
+  115 "  -p, --prefix=PFX:TERMPFX          add a prefix\n"
+  116 "  -b, --boolean-prefix=PFX:TERMPFX  add a boolean prefix\n"
+  117 "  -f, --flags=FLAG1[,FLAG2]...      specify QueryParser flags.  Valid flags:";
+  118 #define INDENT \
+  119 "                                    "
+  120     int pos = 256;
+  121     for (const qp_flag * i = flag_tab; i - flag_tab < n_flag_tab; ++i) {
+  122         size_t len = strlen(i->s);
+  123         if (pos < 256) cout << ',';
+  124         if (pos + len >= 78) {
+  125             cout << "\n"INDENT;
+  126             pos = sizeof(INDENT) - 2;
+  127         } else {
+  128             cout << ' ';
+  129         }
+  130         cout << i->s;
+  131         pos += len + 2;
+  132     }
+  133     cout << "\n"
+  134 "  -o, --default-op=OP               specify QueryParser default operator\n"
+  135 "                                    (default: or).  Valid operators:";
+  136     pos = 256;
+  137     for (const qp_op * i = op_tab; i - op_tab < n_op_tab; ++i) {
+  138         size_t len = strlen(i->s);
+  139         if (pos < 256) cout << ',';
+  140         if (pos + len >= 78) {
+  141             cout << "\n"INDENT;
+  142             pos = sizeof(INDENT) - 2;
+  143         } else {
+  144             cout << ' ';
+  145         }
+  146         cout << i->s;
+  147         pos += len + 2;
+  148     }
+  149     cout << "\n"
+  150 "  -w, --weight=SCHEME               specify weighting scheme to use\n"
+  151 "                                    (default: bm25).  Valid schemes:";
+  152     pos = 256;
+  153     for (const wt * i = wt_tab; i - wt_tab < n_wt_tab; ++i) {
+  154         size_t len = strlen(i->s);
+  155         if (pos < 256) cout << ',';
+  156         if (pos + len >= 78) {
+  157             cout << "\n"INDENT;
+  158             pos = sizeof(INDENT) - 2;
+  159         } else {
+  160             cout << ' ';
+  161         }
+  162         cout << i->s;
+  163         pos += len + 2;
+  164     }
+  165     cout << "\n"
+  166 "  -h, --help                        display this help and exit\n"
+  167 "  -v, --version                     output version information and exit\n";
+  168 }
+  169 
+  170 static unsigned
+  171 decode_qp_flag(const char * s)
+  172 {
+  173     qp_flag f;
+  174     f.s = s;
+  175     const qp_flag * p = lower_bound(flag_tab, flag_tab + n_flag_tab, f);
+  176     if (p == flag_tab + n_flag_tab || f < *p)
+  177         return 0;
+  178     return p->f;
+  179 }
+  180 
+  181 static int
+  182 decode_qp_op(const char * s)
+  183 {
+  184     qp_op f;
+  185     f.s = s;
+  186     const qp_op * p = lower_bound(op_tab, op_tab + n_op_tab, f);
+  187     if (p == op_tab + n_op_tab || f < *p)
+  188         return -1;
+  189     return p->f;
+  190 }
+  191 
+  192 static int
+  193 decode_wt(const char * s)
+  194 {
+  195     wt f;
+  196     f.s = s;
+  197     const wt * p = lower_bound(wt_tab, wt_tab + n_wt_tab, f);
+  198     if (p == wt_tab + n_wt_tab || f < *p)
+  199         return -1;
+  200     return p->f;
+  201 }
+  202 
+  203 int
+  204 main(int argc, char **argv)
+  205 try {
+  206     const char * opts = "d:m:c:s:p:b:f:o:w:hv";
+  207     static const struct option long_opts[] = {
+  208         { "db",         required_argument, 0, 'd' },
+  209         { "msize",      required_argument, 0, 'm' },
+  210         { "check-at-least",     required_argument, 0, 'c' },
+  211         { "stemmer",    required_argument, 0, 's' },
+  212         { "prefix",     required_argument, 0, 'p' },
+  213         { "boolean-prefix",     required_argument, 0, 'b' },
+  214         { "flags",      required_argument, 0, 'f' },
+  215         { "default-op", required_argument, 0, 'o' },
+  216         { "weight",     required_argument, 0, 'w' },
+  217         { "help",       no_argument, 0, 'h' },
+  218         { "version",    no_argument, 0, 'v' },
+  219         { NULL,         0, 0, 0}
+  220     };
+  221 
+  222     Xapian::SimpleStopper mystopper(sw, sw + sizeof(sw) / sizeof(sw[0]));
+  223     Xapian::Stem stemmer("english");
+  224     Xapian::doccount msize = 10;
+  225     Xapian::doccount check_at_least = 0;
+  226 
+  227     bool have_database = false;
+  228 
+  229     Xapian::Database db;
+  230     Xapian::QueryParser parser;
+  231     unsigned flags = parser.FLAG_DEFAULT|parser.FLAG_SPELLING_CORRECTION;
+  232     int weight = -1;
+  233 
+  234     int c;
+  235     while ((c = gnu_getopt_long(argc, argv, opts, long_opts, 0)) != -1) {
+  236         switch (c) {
+  237             case 'm': {
+  238                 char * p;
+  239                 unsigned long v = strtoul(optarg, &p, 10);
+  240                 msize = static_cast<Xapian::doccount>(v);
+  241                 if (*p || v != msize) {
+  242                     cerr << PROG_NAME": Bad value '" << optarg
+  243                          << "' passed for msize" << endl;
+  244                     exit(1);
+  245                 }
+  246                 break;
+  247             }
+  248             case 'c': {
+  249                 char * p;
+  250                 unsigned long v = strtoul(optarg, &p, 10);
+  251                 check_at_least = static_cast<Xapian::doccount>(v);
+  252                 if (*p || v != check_at_least) {
+  253                     cerr << PROG_NAME": Bad value '" << optarg
+  254                          << "' passed for check_at_least " << endl;
+  255                     exit(1);
+  256                 }
+  257                 break;
+  258             }
+  259             case 'd':
+  260                 db.add_database(Xapian::Database(optarg));
+  261                 have_database = true;
+  262                 break;
+  263             case 's':
+  264                 try {
+  265                     stemmer = Xapian::Stem(optarg);
+  266                 } catch (const Xapian::InvalidArgumentError &) {
+  267                     cerr << "Unknown stemming language '" << optarg << "'.\n"
+  268                             "Available language names are: "
+  269                          << Xapian::Stem::get_available_languages() << endl;
+  270                     exit(1);
+  271                 }
+  272                 break;
+  273             case 'b': case 'p': {
+  274                 const char * colon = strchr(optarg, ':');
+  275                 if (colon == NULL) {
+  276                     cerr << argv[0] << ": need ':' when setting prefix" << endl;
+  277                     exit(1);
+  278                 }
+  279                 string prefix(optarg, colon - optarg);
+  280                 string termprefix(colon + 1);
+  281                 if (c == 'b') {
+  282                     parser.add_boolean_prefix(prefix, termprefix);
+  283                 } else {
+  284                     parser.add_prefix(prefix, termprefix);
+  285                 }
+  286                 break;
+  287             }
+  288             case 'f':
+  289                 flags = 0;
+  290                 do {
+  291                     char * comma = strchr(optarg, ',');
+  292                     if (comma)
+  293                         *comma++ = '\0';
+  294                     unsigned flag = decode_qp_flag(optarg);
+  295                     if (flag == 0) {
+  296                         cerr << "Unknown flag '" << optarg << "'" << endl;
+  297                         exit(1);
+  298                     }
+  299                     flags |= flag;
+  300                     optarg = comma;
+  301                 } while (optarg);
+  302                 break;
+  303             case 'o': {
+  304                 int op = decode_qp_op(optarg);
+  305                 if (op < 0) {
+  306                     cerr << "Unknown op '" << optarg << "'" << endl;
+  307                     exit(1);
+  308                 }
+  309                 parser.set_default_op(static_cast<Xapian::Query::op>(op));
+  310                 break;
+  311             }
+  312             case 'w': {
+  313                 weight = decode_wt(optarg);
+  314                 if (weight < 0) {
+  315                     cerr << "Unknown weighting scheme '" << optarg << "'" << endl;
+  316                     exit(1);
+  317                 }
+  318                 break;
+  319             }
+  320             case 'v':
+  321                 cout << PROG_NAME" - "PACKAGE_STRING << endl;
+  322                 exit(0);
+  323             case 'h':
+  324                 cout << PROG_NAME" - "PROG_DESC"\n\n";
+  325                 show_usage();
+  326                 exit(0);
+  327             case ':': // missing parameter
+  328             case '?': // unknown option
+  329                 show_usage();
+  330                 exit(1);
+  331         }
+  332     }
+  333 
+  334     if (argc - optind != 1) {
+  335         show_usage();
+  336         exit(1);
+  337     }
+  338 
+  339     parser.set_database(db);
+  340     parser.set_stemmer(stemmer);
+  341     parser.set_stemming_strategy(Xapian::QueryParser::STEM_SOME);
+  342     parser.set_stopper(&mystopper);
+  343 
+  344     Xapian::Query query = parser.parse_query(argv[optind], flags);
+  345     const string & correction = parser.get_corrected_query_string();
+  346     if (!correction.empty())
+  347         cout << "Did you mean: " << correction << "\n\n";
+  348 
+  349     cout << "Parsed Query: " << query.get_description() << endl;
+  350 
+  351     if (!have_database) {
+  352         cout << "No database specified so not running the query." << endl;
+  353         exit(0);
+  354     }
+  355 
+  356     Xapian::Enquire enquire(db);
+  357     enquire.set_query(query);
+  358 
+  359     switch (weight) {
+  360         case WEIGHT_BOOL:
+  361             enquire.set_weighting_scheme(Xapian::BoolWeight());
+  362             break;
+  363         case WEIGHT_BM25:
+  364             enquire.set_weighting_scheme(Xapian::BM25Weight());
+  365             break;
+  366         case WEIGHT_TRAD:
+  367             enquire.set_weighting_scheme(Xapian::TradWeight());
+  368             break;
+  369     }
+  370 
+  371     Xapian::MSet mset = enquire.get_mset(0, msize, check_at_least);
+  372 
+  373     cout << "MSet:" << endl;
+  374     for (Xapian::MSetIterator i = mset.begin(); i != mset.end(); i++) {
+  375         Xapian::Document doc = i.get_document();
+  376         string data = doc.get_data();
+  377         cout << *i << " [" << i.get_percent() << "%]\n" << data << "\n";
+  378     }
+  379     cout << flush;
+  380 } catch (const Xapian::QueryParserError & e) {
+  381     cout << "Couldn't parse query: " << e.get_msg() << endl;
+  382     exit(1);
+  383 } catch (const Xapian::Error & err) {
+  384     cout << err.get_description() << endl;
+  385     exit(1);
+  386 }
